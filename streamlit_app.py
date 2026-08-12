@@ -15,6 +15,7 @@ APP_DIR = Path(__file__).resolve().parent
 BACKEND_FILE = APP_DIR / "sec_backend.py"
 KEYWORDS_FILE = APP_DIR / "keywords.txt"
 MAX_RELEASES_PER_RUN = 75
+UI_VERSION = "assembly-line-v2"
 
 st.set_page_config(
     page_title="SEC Litigation Release Tool",
@@ -32,59 +33,77 @@ st.markdown(
     """
     <style>
     .block-container {
-        max-width: 1500px;
-        padding-top: 1.6rem;
-        padding-bottom: 4rem;
+        max-width: 1120px;
+        padding-top: 1.0rem;
+        padding-bottom: 2.2rem;
     }
     [data-testid="stSidebar"] {
         border-right: 1px solid #dfe5ec;
     }
     .sec-hero {
-        padding: 1.25rem 1.45rem;
-        border-radius: 16px;
+        padding: .82rem 1.05rem;
+        border-radius: 13px;
         background: linear-gradient(135deg, #173f66 0%, #245f91 100%);
         color: white;
-        margin-bottom: 1.1rem;
-        box-shadow: 0 6px 20px rgba(25, 75, 122, 0.16);
+        margin-bottom: .75rem;
+        box-shadow: 0 4px 14px rgba(25, 75, 122, 0.13);
     }
     .sec-hero h1 {
         margin: 0;
-        font-size: 1.7rem;
+        font-size: 1.42rem;
         font-weight: 700;
         letter-spacing: -0.02em;
     }
     .sec-hero p {
-        margin: .35rem 0 0;
-        opacity: .88;
-        font-size: .98rem;
+        margin: .18rem 0 0;
+        opacity: .86;
+        font-size: .86rem;
     }
-    .step-pill {
-        display: inline-block;
-        padding: .22rem .62rem;
-        border-radius: 999px;
-        background: #e9f1f8;
+    .work-card {
+        padding: .8rem 1rem;
+        border: 1px solid #dfe5ec;
+        border-radius: 12px;
+        background: #ffffff;
+        margin: .55rem 0 .8rem;
+    }
+    .work-card-title {
+        font-size: 1.12rem;
+        font-weight: 750;
+        color: #183b5b;
+        margin-bottom: .12rem;
+    }
+    .work-card-subtitle {
+        color: #5d6c7b;
+        font-size: .88rem;
+    }
+    .next-action {
+        margin: .45rem 0 .55rem;
         color: #194b7a;
-        font-weight: 700;
         font-size: .78rem;
-        margin-bottom: .45rem;
+        font-weight: 800;
+        letter-spacing: .055em;
+        text-transform: uppercase;
     }
-    .muted {
+    .compact-status {
         color: #607080;
-        font-size: .9rem;
+        font-size: .84rem;
     }
     .status-complete { color: #137333; font-weight: 700; }
     .status-review { color: #9a6700; font-weight: 700; }
     .status-unavailable { color: #b3261e; font-weight: 700; }
     .status-ready { color: #194b7a; font-weight: 700; }
+    .small-note {
+        font-size: .82rem;
+        color: #657586;
+    }
     div[data-testid="stMetric"] {
         background: white;
         border: 1px solid #e1e7ee;
-        padding: .7rem .9rem;
-        border-radius: 12px;
+        padding: .45rem .65rem;
+        border-radius: 10px;
     }
-    .small-note {
-        font-size: .84rem;
-        color: #657586;
+    div[data-testid="stTextArea"] textarea {
+        font-size: .9rem;
     }
     </style>
     """,
@@ -342,16 +361,25 @@ def count_statuses():
 
 
 def first_incomplete_release():
-    statuses = all_statuses()
+    """Returns the next release that still requires user work."""
 
-    for release_no, status, _ in statuses:
+    for release_no, status, _ in all_statuses():
         if status in {"manual", "chatgpt"}:
             return release_no
 
-    if statuses:
-        return statuses[0][0]
-
     return None
+
+
+def select_release(release_no: str | None):
+    """Selects the release shown in the main work area."""
+
+    st.session_state.selected_release = release_no
+
+
+def advance_to_next_task():
+    """Moves the assembly line to the next release that still needs work."""
+
+    select_release(first_incomplete_release())
 
 
 def validate_uploaded_database(uploaded_bytes: bytes):
@@ -443,25 +471,45 @@ def render_header():
         """
         <div class="sec-hero">
           <h1>SEC Litigation Release Tool</h1>
-          <p>Extract SEC Litigation Releases, recover unreadable PDFs, validate the manual ChatGPT result, and export the completed interval to Excel.</p>
+          <p>One release at a time. Complete the current task and the next case opens automatically.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_metrics():
+def render_workflow_progress(current_release: str | None):
+    """Compact progress indicator that stays above the current task."""
+
     if not st.session_state.run_ready:
         return
 
     counts = count_statuses()
     total = len(release_numbers_for_current_run())
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Releases", total)
-    c2.metric("Complete", counts["complete"])
-    c3.metric("ChatGPT ready", counts["chatgpt"])
-    c4.metric("Manual PDFs", counts["manual"])
-    c5.metric("Unavailable", counts["unavailable"] + counts["missing"])
+    resolved = counts["complete"] + counts["unavailable"] + counts["missing"]
+    ratio = resolved / total if total else 0
+
+    left, right = st.columns([4, 1.25])
+    with left:
+        st.caption(
+            f"LR-{st.session_state.range_start} → LR-{st.session_state.range_end}  ·  "
+            f"{resolved} of {total} resolved"
+        )
+        st.progress(ratio)
+    with right:
+        st.metric("Complete", counts["complete"])
+
+    if counts["manual"] or counts["chatgpt"] or counts["unavailable"]:
+        st.caption(
+            f"Pending: {counts['manual']} manual PDF · {counts['chatgpt']} ChatGPT · "
+            f"{counts['unavailable'] + counts['missing']} unavailable"
+        )
+
+    if current_release:
+        st.markdown(
+            f'<div class="compact-status">Current task: <strong>{current_release}</strong></div>',
+            unsafe_allow_html=True,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -627,87 +675,168 @@ def validate_chatgpt_submission(record, case_id, source_block, response_text):
     }
 
 
+def generate_excel_report():
+    """Creates the current interval Excel file and stores it in session state."""
+
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    export_path, release_count, document_count = backend.export_interval_to_excel(
+        DATABASE_FILE,
+        EXPORT_DIR,
+        int(st.session_state.range_start),
+        int(st.session_state.range_end),
+    )
+    export_path = Path(export_path)
+    st.session_state.excel_bytes = export_path.read_bytes()
+    st.session_state.excel_name = export_path.name
+    return release_count, document_count
+
+
+def render_case_card(record, status):
+    respondent = record["Respondents"] or "No respondent data"
+    date_text = record["Date"] or "No date extracted"
+    st.markdown(
+        f"""
+        <div class="work-card">
+            <div class="work-card-title">{record['Release No.']} · {respondent}</div>
+            <div class="work-card-subtitle">{date_text} · {status_label(status)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_manual_pdf_recovery(record):
+    """Shows exactly one unresolved PDF at a time."""
+
     bad_documents = [
         document
         for document in record["Documents"]
         if document["manual_review_required"]
     ]
 
-    st.markdown('<span class="step-pill">STEP 2 · MANUAL PDF RECOVERY</span>', unsafe_allow_html=True)
-    st.subheader("Readable text is required before the ChatGPT step")
-    st.warning(
-        f"{len(bad_documents)} Resource document(s) could not be extracted reliably. "
-        "Open each SEC PDF, obtain readable text manually, and paste it below."
+    if not bad_documents:
+        return
+
+    document = bad_documents[0]
+    total_documents = len(record["Documents"])
+    resolved_manual = sum(
+        1
+        for document_item in record["Documents"]
+        if document_item.get("text_source") == "manual"
+        and not document_item["manual_review_required"]
+    )
+    document_identifier = uuid.uuid5(uuid.NAMESPACE_URL, document["url"]).hex[:12]
+    text_key = f"manual_pdf_text::{record['Release No.']}::{document_identifier}"
+
+    st.markdown('<div class="next-action">Next action · Recover unreadable PDF text</div>', unsafe_allow_html=True)
+
+    top_left, top_right = st.columns([4.2, 1.35])
+    with top_left:
+        st.subheader(document["name"])
+        st.caption(
+            f"One Resource PDF requires manual text. "
+            f"{len(bad_documents)} unresolved document(s) remain for this release."
+        )
+    with top_right:
+        st.link_button(
+            "Open SEC PDF ↗",
+            document["url"],
+            use_container_width=True,
+        )
+
+    st.warning(document["review_reason"] or "Automatic text extraction was unreliable.")
+
+    manual_text = st.text_area(
+        "Paste the complete readable text from the PDF",
+        key=text_key,
+        height=245,
+        placeholder="Open the SEC PDF, extract the readable text manually, then paste it here…",
     )
 
-    for position, document in enumerate(bad_documents, start=1):
-        with st.container(border=True):
-            top_left, top_right = st.columns([4, 1])
-            with top_left:
-                st.markdown(f"#### {position}. {document['name']}")
-                st.caption(document["review_reason"] or "Automatic text extraction was unreliable.")
-            with top_right:
-                st.link_button(
-                    "Open SEC PDF",
-                    document["url"],
-                    use_container_width=True,
-                )
+    wrong_paste_reason = ""
+    if manual_text.strip():
+        wrong_paste_reason = backend.looks_like_wrong_manual_pdf_paste(
+            manual_text,
+            document["url"],
+        )
 
-            text_key = f"manual_pdf_text::{record['Release No.']}::{position}"
-            manual_text = st.text_area(
-                "Paste the manually extracted PDF text",
-                key=text_key,
-                height=240,
-                placeholder="Paste the complete readable text from this PDF here…",
-            )
+    if wrong_paste_reason:
+        st.error(wrong_paste_reason)
 
-            wrong_paste_reason = ""
-            if manual_text.strip():
-                wrong_paste_reason = backend.looks_like_wrong_manual_pdf_paste(
-                    manual_text,
-                    document["url"],
-                )
+    short_text = bool(manual_text.strip()) and len(manual_text.strip()) < 100
+    confirmed_short = True
 
-            if wrong_paste_reason:
-                st.error(wrong_paste_reason)
+    if short_text and not wrong_paste_reason:
+        st.warning(
+            f"Only {len(manual_text.strip())} characters were pasted. "
+            "Confirm this really is the complete readable text."
+        )
+        confirmed_short = st.checkbox(
+            "I checked the PDF and confirm the text is complete.",
+            key=f"confirm_short::{record['Release No.']}::{document_identifier}",
+        )
 
-            short_text = manual_text.strip() and len(manual_text.strip()) < 100
-            confirmed_short = True
+    save_disabled = (
+        not manual_text.strip()
+        or bool(wrong_paste_reason)
+        or not confirmed_short
+    )
 
-            if short_text and not wrong_paste_reason:
-                st.warning(
-                    f"Only {len(manual_text.strip())} characters were pasted. "
-                    "That may be correct for a very short filing, but please confirm it."
-                )
-                confirmed_short = st.checkbox(
-                    "I checked the PDF and confirm this is the complete readable text.",
-                    key=f"confirm_short::{record['Release No.']}::{position}",
-                )
+    if st.button(
+        "Save & continue →",
+        key=f"save_manual::{record['Release No.']}::{document_identifier}",
+        type="primary",
+        disabled=save_disabled,
+        use_container_width=True,
+    ):
+        backend.save_manual_document_text(
+            record["Release No."],
+            document,
+            manual_text,
+        )
+        st.session_state.excel_bytes = None
+        st.session_state.excel_name = None
+        st.session_state.pop(text_key, None)
+        st.session_state.validation_results.pop(record["Release No."], None)
+        st.toast("Manual PDF text saved.", icon="✅")
+        st.rerun()
 
-            save_disabled = (
-                not manual_text.strip()
-                or bool(wrong_paste_reason)
-                or not confirmed_short
-            )
+    with st.expander("Source details", expanded=False):
+        st.write(f"Resource documents in this release: {total_documents}")
+        st.write(f"Manually recovered so far: {resolved_manual}")
+        st.code(document["url"], language=None)
 
-            if st.button(
-                "Save manual PDF text",
-                key=f"save_manual::{record['Release No.']}::{position}",
-                type="primary",
-                disabled=save_disabled,
-                use_container_width=True,
-            ):
-                backend.save_manual_document_text(
-                    record["Release No."],
-                    document,
-                    manual_text,
-                )
-                st.success("Manual text saved to the temporary session database.")
-                st.rerun()
+
+def save_chatgpt_result(record, validation, overwrite=False):
+    parsed = validation["parsed"]
+    backend.save_manual_fields(
+        record["Release No."],
+        parsed["keyword"],
+        parsed["complaint"],
+        overwrite=overwrite,
+    )
+    st.session_state.excel_bytes = None
+    st.session_state.excel_name = None
+    st.session_state.validation_results.pop(record["Release No."], None)
+    st.session_state.pop(f"force_review::{record['Release No.']}", None)
+    st.session_state.pop(f"chatgpt_response::{record['Release No.']}", None)
+    advance_to_next_task()
+
+
+def render_validation_details(validation):
+    with st.expander("Validation details", expanded=False):
+        for check in validation.get("checks", []):
+            st.success(check, icon="✅")
+        for issue in validation.get("issues", []):
+            if issue["severity"] == "critical":
+                st.error(issue["message"], icon="⛔")
+            else:
+                st.warning(issue["message"], icon="⚠️")
 
 
 def render_chatgpt_review(record):
+    """One-click normal path: copy prompt -> paste response -> validate & save."""
+
     release_no = record["Release No."]
     approved_keywords = backend.load_keywords()
 
@@ -716,18 +845,20 @@ def render_chatgpt_review(record):
 
     case_id = st.session_state.case_ids[release_no]
     source_block = backend.build_source_block(record, case_id, approved_keywords)
+    force_review = bool(st.session_state.get(f"force_review::{release_no}"))
 
-    st.markdown('<span class="step-pill">STEP 3 · CHATGPT REVIEW</span>', unsafe_allow_html=True)
-    st.subheader("Generate the keyword and summary in your dedicated ChatGPT chat")
+    st.markdown('<div class="next-action">Next action · ChatGPT keyword & summary</div>', unsafe_allow_html=True)
     st.caption(
-        "The prompt contains the current keyword catalogue, all readable Resource documents, "
-        "the Case ID, and the strict machine-readable output format."
+        "Copy the prepared source package into the dedicated ChatGPT chat, then paste the complete response below."
     )
 
-    copy_col, download_col = st.columns([2, 1])
-    with copy_col:
-        render_copy_button(source_block, key=case_id)
-    with download_col:
+    render_copy_button(
+        source_block,
+        key=case_id,
+        label="1 · Copy ChatGPT prompt",
+    )
+
+    with st.expander("Prompt / source details", expanded=False):
         st.download_button(
             "Download prompt (.txt)",
             data=source_block.encode("utf-8"),
@@ -735,55 +866,66 @@ def render_chatgpt_review(record):
             mime="text/plain",
             use_container_width=True,
         )
-
-    with st.expander("Show full ChatGPT source prompt", expanded=False):
         st.code(source_block, language=None, wrap_lines=True)
 
     response_key = f"chatgpt_response::{release_no}"
     response_text = st.text_area(
-        "Paste ChatGPT's complete machine-readable response",
+        "2 · Paste ChatGPT's complete machine-readable response",
         key=response_key,
-        height=330,
+        height=260,
         placeholder=(
             "Paste everything from <<< START OF MACHINE-READABLE RESPONSE >>> "
             "through <<< END OF MACHINE-READABLE RESPONSE >>>"
         ),
     )
 
-    validate_col, clear_col = st.columns([2, 1])
+    validation = st.session_state.validation_results.get(release_no)
+    if validation and validation.get("submitted_text") != response_text:
+        st.session_state.validation_results.pop(release_no, None)
+        validation = None
 
-    if validate_col.button(
-        "Validate response",
+    button_label = "3 · Validate & replace →" if force_review else "3 · Validate & save →"
+
+    if st.button(
+        button_label,
         type="primary",
         use_container_width=True,
         disabled=not response_text.strip(),
     ):
-        result = validate_chatgpt_submission(
+        validation = validate_chatgpt_submission(
             record,
             case_id,
             source_block,
             response_text,
         )
-        st.session_state.validation_results[release_no] = result
-        st.rerun()
+        validation["submitted_text"] = response_text
+        st.session_state.validation_results[release_no] = validation
 
-    if clear_col.button("Clear validation", use_container_width=True):
-        st.session_state.validation_results.pop(release_no, None)
+        if validation["parse_error"]:
+            st.rerun()
+
+        critical_issues = [
+            issue for issue in validation["issues"] if issue["severity"] == "critical"
+        ]
+        warning_issues = [
+            issue for issue in validation["issues"] if issue["severity"] != "critical"
+        ]
+
+        if not critical_issues and not warning_issues:
+            save_chatgpt_result(record, validation, overwrite=force_review)
+            st.toast(f"{release_no} saved. Moving to the next case.", icon="✅")
+            st.rerun()
+
         st.rerun()
 
     validation = st.session_state.validation_results.get(release_no)
-
     if not validation:
         return
 
     if validation["parse_error"]:
-        st.error(f"The response could not be parsed: {validation['parse_error']}")
+        st.error(f"The response could not be read: {validation['parse_error']}")
+        st.caption("Correct the pasted response above and click Validate & save again.")
         return
-
-    st.markdown("#### Validation result")
-
-    for check in validation["checks"]:
-        st.success(check, icon="✅")
 
     critical_issues = [
         issue for issue in validation["issues"] if issue["severity"] == "critical"
@@ -792,62 +934,41 @@ def render_chatgpt_review(record):
         issue for issue in validation["issues"] if issue["severity"] != "critical"
     ]
 
-    for issue in critical_issues:
-        st.error(issue["message"], icon="⛔")
-
-    for issue in warning_issues:
-        st.warning(issue["message"], icon="⚠️")
-
     if critical_issues:
-        st.error("Critical checks failed. Nothing can be saved until the response is corrected.")
+        st.error("This response cannot be saved yet.")
+        for issue in critical_issues:
+            st.error(issue["message"], icon="⛔")
+        for issue in warning_issues:
+            st.warning(issue["message"], icon="⚠️")
+        render_validation_details(validation)
+        st.caption("Correct the response above and click Validate & save again.")
         return
 
-    parsed = validation["parsed"]
-
-    with st.container(border=True):
-        st.markdown(f"**Keyword:** {parsed['keyword']}")
-        summary_preview = parsed["complaint"][:800]
-        if len(parsed["complaint"]) > 800:
-            summary_preview += "…"
-        st.markdown("**Summary preview:**")
-        st.text(summary_preview)
-
-    warning_confirmed = True
     if warning_issues:
-        warning_confirmed = st.checkbox(
-            "I reviewed the warning(s) above and want to save this result.",
-            key=f"warning_confirm::{release_no}",
-        )
+        st.warning("The response passed the critical checks, but needs your review.")
+        for issue in warning_issues:
+            st.warning(issue["message"], icon="⚠️")
 
-    existing_values = backend.load_existing_fields(release_no)
-    already_complete = bool(
-        existing_values["keyword"].strip() or existing_values["complaint"].strip()
-    )
+        left, right = st.columns([1.4, 1])
+        if left.button(
+            "Save anyway & continue →",
+            type="primary",
+            use_container_width=True,
+            key=f"save_warning::{release_no}",
+        ):
+            save_chatgpt_result(record, validation, overwrite=force_review)
+            st.toast(f"{release_no} saved. Moving to the next case.", icon="✅")
+            st.rerun()
 
-    replace_existing = False
-    if already_complete:
-        st.info("This release already contains a saved Keyword and/or Complaint summary.")
-        replace_existing = st.checkbox(
-            "Replace the existing saved result",
-            key=f"replace_existing::{release_no}",
-        )
+        if right.button(
+            "Use corrected response",
+            use_container_width=True,
+            key=f"correct_warning::{release_no}",
+        ):
+            st.session_state.validation_results.pop(release_no, None)
+            st.rerun()
 
-    if st.button(
-        "Save validated result",
-        type="primary",
-        use_container_width=True,
-        disabled=(not warning_confirmed or (already_complete and not replace_existing)),
-    ):
-        backend.save_manual_fields(
-            release_no,
-            parsed["keyword"],
-            parsed["complaint"],
-            overwrite=replace_existing,
-        )
-        st.session_state.validation_results.pop(release_no, None)
-        st.session_state.pop(f"force_review::{release_no}", None)
-        st.success("Keyword and summary saved to the temporary session database.")
-        st.rerun()
+        render_validation_details(validation)
 
 
 def render_release_review(release_no: str):
@@ -857,121 +978,235 @@ def render_release_review(release_no: str):
         st.error(f"{release_no} is not present in the temporary session database.")
         return
 
-    status, detail = get_release_status(release_no)
+    status, _ = get_release_status(release_no)
+    render_case_card(record, status)
 
-    with st.container(border=True):
-        left, middle, right = st.columns([2, 4, 1.5])
-        left.markdown(f"### {release_no}")
-        middle.markdown(f"**{record['Respondents'] or 'No respondent data'}**")
-        middle.caption(record["Date"] or "No release date extracted")
-        right.markdown(status_label(status))
-
-        if record["Link to Release"]:
-            st.link_button(
-                "Open SEC Litigation Release",
-                record["Link to Release"],
-            )
+    if record["Link to Release"]:
+        with st.expander("SEC release & source details", expanded=False):
+            st.link_button("Open SEC Litigation Release ↗", record["Link to Release"])
+            st.write(f"Resource documents: {len(record['Documents'])}")
 
     if status == "unavailable":
-        st.markdown('<span class="step-pill">RELEASE UNAVAILABLE</span>', unsafe_allow_html=True)
         st.warning(
-            "The SEC page could not be found or parsed. The release number is still preserved "
-            "in the Excel export, but the remaining fields stay blank."
+            "The SEC page could not be found or parsed. The release number will still appear "
+            "in Excel and the unavailable fields remain blank."
         )
+        next_release = first_incomplete_release()
+        if next_release and next_release != release_no:
+            if st.button("Return to next task →", type="primary", use_container_width=True):
+                select_release(next_release)
+                st.rerun()
+        elif next_release is None:
+            if st.button("Return to export →", type="primary", use_container_width=True):
+                select_release(None)
+                st.rerun()
         return
 
     if status == "manual":
         render_manual_pdf_recovery(record)
         return
 
-    if status == "complete":
-        st.markdown('<span class="step-pill">COMPLETE</span>', unsafe_allow_html=True)
-        st.success("This release already has a validated keyword and summary.")
-        with st.expander("Review saved result"):
+    if status == "complete" and not st.session_state.get(f"force_review::{release_no}"):
+        st.success("This release is complete.")
+        with st.expander("Review saved keyword and summary", expanded=False):
             st.markdown(f"**Keyword:** {record['Keyword']}")
             st.markdown(record["Complaint"])
 
-        if st.button("Re-open ChatGPT review for this release"):
+        next_release = first_incomplete_release()
+        left, right = st.columns([1.6, 1])
+        if next_release and next_release != release_no:
+            if left.button("Return to next task →", type="primary", use_container_width=True):
+                select_release(next_release)
+                st.rerun()
+        elif next_release is None:
+            if left.button("Return to export →", type="primary", use_container_width=True):
+                select_release(None)
+                st.rerun()
+        if right.button("Re-open this release", use_container_width=True):
             st.session_state.validation_results.pop(release_no, None)
-            # We leave the values intact; the review screen will require explicit replacement.
             st.session_state[f"force_review::{release_no}"] = True
             st.rerun()
-
-        if not st.session_state.get(f"force_review::{release_no}"):
-            return
+        return
 
     render_chatgpt_review(record)
 
 
+def render_run_complete():
+    counts = count_statuses()
+    total = len(release_numbers_for_current_run())
+    unavailable = counts["unavailable"] + counts["missing"]
+
+    st.markdown('<div class="next-action">Run complete · Export</div>', unsafe_allow_html=True)
+    st.subheader("The review queue is finished")
+
+    if unavailable:
+        st.warning(
+            f"{unavailable} release(s) were unavailable or not extractable. "
+            "They will still appear in Excel with the information that is available."
+        )
+    else:
+        st.success(f"All {total} releases are complete.")
+
+    if st.session_state.excel_bytes is None:
+        with st.spinner("Preparing Excel report…"):
+            try:
+                release_count, document_count = generate_excel_report()
+                st.caption(
+                    f"Prepared {release_count} releases and {document_count} Resource document links."
+                )
+            except Exception as error:
+                st.error(f"Excel export failed: {error}")
+                return
+
+    st.download_button(
+        "Download Excel report",
+        data=st.session_state.excel_bytes,
+        file_name=st.session_state.excel_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
+
+    st.caption(
+        "The temporary progress database remains available in the sidebar until you start a new run."
+    )
+
+
 # -----------------------------------------------------------------------------
-# SIDEBAR
+# SIDEBAR — SECONDARY NAVIGATION / RECOVERY ONLY
 # -----------------------------------------------------------------------------
 
 
 with st.sidebar:
     st.markdown("### SEC Litigation Tool")
-    st.caption("Temporary online session — your local database is never accessed.")
+    st.caption("Assembly-line mode")
 
     if st.session_state.run_ready:
-        st.markdown("---")
+        statuses = all_statuses()
+        release_options = [release_no for release_no, _, _ in statuses]
+        next_task = first_incomplete_release()
+
         st.markdown(
-            f"**Current interval**  \nLR-{st.session_state.range_start} → LR-{st.session_state.range_end}"
+            f"**LR-{st.session_state.range_start} → LR-{st.session_state.range_end}**"
+        )
+        counts = count_statuses()
+        st.caption(
+            f"{counts['complete']} complete · {counts['manual']} manual PDF · "
+            f"{counts['chatgpt']} ChatGPT"
         )
 
-        progress_bytes = DATABASE_FILE.read_bytes() if DATABASE_FILE.exists() else b""
-        st.download_button(
-            "Download progress database",
-            data=progress_bytes,
-            file_name=(
-                f"SEC_progress_LR-{st.session_state.range_start}_"
-                f"to_LR-{st.session_state.range_end}.db"
-            ),
-            mime="application/octet-stream",
-            use_container_width=True,
-            help="Use this file to resume if the browser session is lost.",
-        )
+        if release_options:
+            if (
+                st.session_state.selected_release not in release_options
+                and st.session_state.selected_release is not None
+            ):
+                select_release(next_task)
 
-    st.markdown("---")
-    st.markdown("**Resume a previous web run**")
-    resume_file = st.file_uploader(
-        "Upload progress database",
-        type=["db", "sqlite", "sqlite3"],
-        label_visibility="collapsed",
-    )
+            jump_options = ["— Select a release —", *release_options]
+            current_jump_index = (
+                release_options.index(st.session_state.selected_release) + 1
+                if st.session_state.selected_release in release_options
+                else 0
+            )
+            selected = st.selectbox(
+                "Jump to release",
+                jump_options,
+                index=current_jump_index,
+                key=f"jump_release_selector::{st.session_state.selected_release or 'none'}",
+                help="Normally you do not need this. Use it only to inspect or revisit another release.",
+            )
 
-    if resume_file is not None:
-        if st.button("Resume uploaded run", use_container_width=True):
-            uploaded_bytes = resume_file.getvalue()
-            valid, error_message = validate_uploaded_database(uploaded_bytes)
+            if selected != "— Select a release —" and selected != st.session_state.selected_release:
+                st.session_state.selected_release = selected
 
-            if not valid:
-                st.error(error_message)
-            else:
-                DATABASE_FILE.write_bytes(uploaded_bytes)
-                backend.create_database()
-                inferred_start, inferred_end = infer_range_from_database()
-
-                if inferred_start is None:
-                    st.error("The uploaded database does not contain any releases.")
-                else:
-                    st.session_state.range_start = inferred_start
-                    st.session_state.range_end = inferred_end
-                    st.session_state.run_ready = True
-                    st.session_state.selected_release = first_incomplete_release()
-                    reset_review_state()
-                    st.success("Progress restored.")
+            if next_task and st.session_state.selected_release != next_task:
+                if st.button("Return to next task", use_container_width=True):
+                    select_release(next_task)
                     st.rerun()
 
-    if st.session_state.run_ready:
-        st.markdown("---")
-        if st.button("Start a new run", use_container_width=True):
-            clear_session_database()
-            st.session_state.range_start = None
-            st.session_state.range_end = None
-            st.session_state.run_ready = False
-            st.session_state.selected_release = None
-            reset_review_state()
-            st.rerun()
+        with st.expander("View all releases", expanded=False):
+            for release_no, status, detail in statuses:
+                marker = "→" if release_no == st.session_state.selected_release else ""
+                st.markdown(f"{marker} **{release_no}** · {status_label(status)}")
+                if status in {"manual", "unavailable", "missing"}:
+                    st.caption(detail)
+
+        with st.expander("Session & recovery", expanded=False):
+            progress_bytes = DATABASE_FILE.read_bytes() if DATABASE_FILE.exists() else b""
+            st.download_button(
+                "Download progress database",
+                data=progress_bytes,
+                file_name=(
+                    f"SEC_progress_LR-{st.session_state.range_start}_"
+                    f"to_LR-{st.session_state.range_end}.db"
+                ),
+                mime="application/octet-stream",
+                use_container_width=True,
+            )
+
+            if st.session_state.last_processing_log:
+                with st.expander("Extraction log"):
+                    for line in st.session_state.last_processing_log:
+                        st.text(line)
+
+            if st.button("Start a new run", use_container_width=True):
+                clear_session_database()
+                st.session_state.range_start = None
+                st.session_state.range_end = None
+                st.session_state.run_ready = False
+                st.session_state.selected_release = None
+                reset_review_state()
+                st.rerun()
+
+        if first_incomplete_release() is not None:
+            with st.expander("Export current results", expanded=False):
+                if st.button("Prepare Excel now", use_container_width=True):
+                    try:
+                        release_count, document_count = generate_excel_report()
+                        st.success(
+                            f"Prepared {release_count} releases / {document_count} Resource documents."
+                        )
+                    except Exception as error:
+                        st.error(f"Excel export failed: {error}")
+
+                if st.session_state.excel_bytes:
+                    st.download_button(
+                        "Download current Excel",
+                        data=st.session_state.excel_bytes,
+                        file_name=st.session_state.excel_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+
+    else:
+        with st.expander("Resume previous run", expanded=False):
+            resume_file = st.file_uploader(
+                "Upload progress database",
+                type=["db", "sqlite", "sqlite3"],
+                label_visibility="collapsed",
+            )
+
+            if resume_file is not None:
+                if st.button("Resume uploaded run", use_container_width=True):
+                    uploaded_bytes = resume_file.getvalue()
+                    valid, error_message = validate_uploaded_database(uploaded_bytes)
+
+                    if not valid:
+                        st.error(error_message)
+                    else:
+                        DATABASE_FILE.write_bytes(uploaded_bytes)
+                        backend.create_database()
+                        inferred_start, inferred_end = infer_range_from_database()
+
+                        if inferred_start is None:
+                            st.error("The uploaded database does not contain any releases.")
+                        else:
+                            st.session_state.range_start = inferred_start
+                            st.session_state.range_end = inferred_end
+                            st.session_state.run_ready = True
+                            reset_review_state()
+                            select_release(first_incomplete_release())
+                            st.rerun()
 
 
 # -----------------------------------------------------------------------------
@@ -982,11 +1217,10 @@ with st.sidebar:
 render_header()
 
 if not st.session_state.run_ready:
-    st.markdown('<span class="step-pill">STEP 1 · START A RUN</span>', unsafe_allow_html=True)
-    st.subheader("Choose the SEC Litigation Release interval")
-    st.write(
-        "The online version creates a temporary database only for this browser session. "
-        "Nothing is written to your local `sec_releases.db`."
+    st.subheader("Start a release interval")
+    st.caption(
+        "The web version uses a temporary database for this browser session only. "
+        "Your local SEC database is never accessed."
     )
 
     with st.container(border=True):
@@ -1009,16 +1243,16 @@ if not st.session_state.run_ready:
         low = min(int(start_input), int(end_input))
         count = high - low + 1
 
-        st.caption(f"This run will process {count} release(s): LR-{high} through LR-{low}.")
+        st.caption(f"{count} release(s): LR-{high} through LR-{low}")
 
         if count > MAX_RELEASES_PER_RUN:
             st.error(
-                f"For the web version, one run is limited to {MAX_RELEASES_PER_RUN} releases. "
+                f"One web run is limited to {MAX_RELEASES_PER_RUN} releases. "
                 "Use a smaller interval."
             )
 
         if st.button(
-            "Extract interval",
+            "Start processing →",
             type="primary",
             use_container_width=True,
             disabled=count > MAX_RELEASES_PER_RUN,
@@ -1031,114 +1265,24 @@ if not st.session_state.run_ready:
             with st.status("Extracting SEC releases and Resource PDFs…", expanded=True) as status_box:
                 process_release_interval(high, low)
                 status_box.update(
-                    label="SEC extraction completed",
+                    label="Extraction complete",
                     state="complete",
                     expanded=False,
                 )
 
             st.session_state.run_ready = True
-            st.session_state.selected_release = first_incomplete_release()
+            select_release(first_incomplete_release())
             st.rerun()
 
 else:
-    render_metrics()
-    st.markdown("")
+    next_task = first_incomplete_release()
 
-    statuses = all_statuses()
-    release_options = [release_no for release_no, _, _ in statuses]
+    if st.session_state.selected_release is None and next_task is not None:
+        select_release(next_task)
 
-    if st.session_state.selected_release not in release_options:
-        st.session_state.selected_release = first_incomplete_release()
+    render_workflow_progress(st.session_state.selected_release)
 
-    left_panel, main_panel = st.columns([1.2, 3.8], gap="large")
-
-    with left_panel:
-        st.markdown("### Release queue")
-        st.caption("Select any release. Completed work stays in the temporary session database.")
-
-        selected = st.selectbox(
-            "Release",
-            release_options,
-            index=(
-                release_options.index(st.session_state.selected_release)
-                if st.session_state.selected_release in release_options
-                else 0
-            ),
-            label_visibility="collapsed",
-        )
-        st.session_state.selected_release = selected
-
-        with st.container(border=True):
-            for release_no, status, detail in statuses:
-                marker = "→ " if release_no == selected else ""
-                st.markdown(f"{marker}**{release_no}** · {status_label(status)}")
-                st.caption(detail)
-
-        if st.session_state.last_processing_log:
-            with st.expander("Extraction log"):
-                for line in st.session_state.last_processing_log:
-                    st.text(line)
-
-    with main_panel:
-        render_release_review(selected)
-
-    st.markdown("---")
-    st.markdown('<span class="step-pill">STEP 4 · EXPORT</span>', unsafe_allow_html=True)
-    st.subheader("Excel export")
-
-    counts = count_statuses()
-    incomplete_count = (
-        counts["manual"]
-        + counts["chatgpt"]
-        + counts["unavailable"]
-        + counts["missing"]
-    )
-
-    if incomplete_count:
-        st.warning(
-            f"{incomplete_count} release(s) are still incomplete, manually flagged, or unavailable. "
-            "You can still export the information currently available, exactly like in the local workflow."
-        )
+    if st.session_state.selected_release is None:
+        render_run_complete()
     else:
-        st.success("All releases in the selected interval are complete.")
-
-    export_col, progress_col = st.columns([2, 1])
-
-    if export_col.button(
-        "Generate Excel report",
-        type="primary",
-        use_container_width=True,
-    ):
-        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            export_path, release_count, document_count = backend.export_interval_to_excel(
-                DATABASE_FILE,
-                EXPORT_DIR,
-                int(st.session_state.range_start),
-                int(st.session_state.range_end),
-            )
-            export_path = Path(export_path)
-            st.session_state.excel_bytes = export_path.read_bytes()
-            st.session_state.excel_name = export_path.name
-            st.success(
-                f"Excel created: {release_count} releases and {document_count} Resource documents exported."
-            )
-        except Exception as error:
-            st.error(f"Excel export failed: {error}")
-
-    if st.session_state.excel_bytes:
-        progress_col.download_button(
-            "Download Excel",
-            data=st.session_state.excel_bytes,
-            file_name=st.session_state.excel_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            use_container_width=True,
-        )
-    else:
-        progress_col.info("Generate the report first.")
-
-    st.caption(
-        "Tip: download the progress database before closing a long session. "
-        "A browser refresh or Community Cloud restart can reset session state."
-    )
+        render_release_review(st.session_state.selected_release)
