@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -10,12 +11,15 @@ from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 
+import sec_feed
+import sec_history
+
 
 APP_DIR = Path(__file__).resolve().parent
 BACKEND_FILE = APP_DIR / "sec_backend.py"
 KEYWORDS_FILE = APP_DIR / "keywords.txt"
 MAX_RELEASES_PER_RUN = 75
-UI_VERSION = "assembly-line-v2"
+UI_VERSION = "assembly-line-v3"
 
 st.set_page_config(
     page_title="SEC Litigation Release Tool",
@@ -128,6 +132,9 @@ def initialize_session_state():
         "excel_bytes": None,
         "excel_name": None,
         "last_processing_log": [],
+        "history_seeded": False,
+        "history_reload": 0,
+        "autosaved_release": None,
     }
 
     for key, value in defaults.items():
@@ -186,10 +193,104 @@ def db_connection():
     return connection
 
 
+# -----------------------------------------------------------------------------
+# PUBLISHED HISTORY
+#
+# The historical database is published as a GitHub release asset and downloaded
+# here. It gives the app three things it did not have before:
+#   - it knows which releases have already been processed;
+#   - duplicate-summary detection works against the whole history, not just
+#     the current browser session;
+#   - the start screen can offer the new releases directly.
+# If the download fails the app still works exactly as it did before.
+# -----------------------------------------------------------------------------
+
+
+@st.cache_resource(show_spinner=False)
+def load_history(cache_buster: int = 0):
+    try:
+        path = sec_history.download_history()
+    except sec_history.HistoryUnavailable as error:
+        return {
+            "available": False,
+            "error": str(error),
+            "stored": set(),
+            "reviewed": set(),
+            "highest_stored": None,
+            "info": {},
+            "path": None,
+        }
+
+    index = sec_history.read_index(path)
+    index["available"] = True
+    index["error"] = ""
+    index["path"] = str(path)
+    index["info"] = sec_history.read_info(path)
+    return index
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_sec_listing(cache_buster: int = 0):
+    """Which releases SEC.gov currently shows. Cached for 30 minutes."""
+
+    try:
+        listing = sec_feed.fetch_published_releases()
+    except Exception as error:  # noqa: BLE001
+        return {"available": False, "error": str(error), "numbers": [], "details": {}}
+
+    return {
+        "available": True,
+        "error": "",
+        "numbers": sorted(listing.numbers, reverse=True),
+        "details": listing.details,
+    }
+
+
+def pending_releases():
+    """Release numbers published by SEC that are not yet in the history."""
+
+    history = load_history(st.session_state.get("history_reload", 0))
+    listing = load_sec_listing(st.session_state.get("history_reload", 0))
+
+    if not listing["available"] or not history["available"]:
+        return []
+
+    highest_stored = history["highest_stored"] or 0
+    floor = max(min(listing["numbers"]), highest_stored - 50)
+
+    return sorted(
+        (
+            number
+            for number in listing["numbers"]
+            if number >= floor and number not in history["stored"]
+        ),
+        reverse=True,
+    )
+
+
+def seed_session_database():
+    """Starts the session database from the published history, when available."""
+
+    history = load_history(st.session_state.get("history_reload", 0))
+
+    if history["available"] and history["path"]:
+        try:
+            shutil.copyfile(history["path"], DATABASE_FILE)
+            backend.create_database()
+            st.session_state.history_seeded = True
+            return True
+        except Exception:  # noqa: BLE001 - fall back to an empty database
+            DATABASE_FILE.unlink(missing_ok=True)
+
+    backend.create_database()
+    st.session_state.history_seeded = False
+    return False
+
+
 def clear_session_database():
     if DATABASE_FILE.exists():
         DATABASE_FILE.unlink()
-    backend.create_database()
+    seed_session_database()
 
 
 def infer_range_from_database():
@@ -421,10 +522,24 @@ def reset_review_state():
 # -----------------------------------------------------------------------------
 
 
-def render_copy_button(text: str, key: str, label: str = "Copy prompt to clipboard"):
-    """Browser-side clipboard button with a normal text fallback below it."""
+def render_copy_button(
+    text: str,
+    key: str,
+    label: str = "Copy prompt to clipboard",
+    auto_copy: bool = True,
+):
+    """
+    Puts the prompt on the clipboard.
+
+    When the browser allows it (Chrome and Edge normally do while the tab is
+    in the foreground) the prompt is copied the moment the case opens, so the
+    user only has to switch to ChatGPT and press Ctrl+V. Browsers that refuse
+    a copy without a click -- Safari and Firefox -- show the button instead,
+    and the copy icon on the source block below stays as a third fallback.
+    """
 
     encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    auto_flag = "true" if auto_copy else "false"
     html = f"""
     <div style="font-family: Arial, sans-serif;">
       <button id="copy-{key}" style="
@@ -437,22 +552,62 @@ def render_copy_button(text: str, key: str, label: str = "Copy prompt to clipboa
     <script>
     const button = document.getElementById('copy-{key}');
     const message = document.getElementById('msg-{key}');
-    button.addEventListener('click', async () => {{
+
+    function promptText() {{
+        const raw = atob('{encoded}');
+        const bytes = Uint8Array.from(raw, c => c.charCodeAt(0));
+        return new TextDecoder('utf-8').decode(bytes);
+    }}
+
+    function reportCopied(automatic) {{
+        message.textContent = automatic
+            ? 'Already on your clipboard — switch to ChatGPT and press Ctrl+V.'
+            : 'Copied. Paste it into your dedicated ChatGPT chat.';
+        message.style.color = '#137333';
+        button.textContent = 'Copy again';
+        button.style.background = '#137333';
+    }}
+
+    async function copyNow(automatic) {{
         try {{
-            const raw = atob('{encoded}');
-            const bytes = Uint8Array.from(raw, c => c.charCodeAt(0));
-            const text = new TextDecoder('utf-8').decode(bytes);
-            await navigator.clipboard.writeText(text);
-            message.textContent = 'Copied. Paste it into your dedicated ChatGPT chat.';
-            message.style.color = '#137333';
+            await navigator.clipboard.writeText(promptText());
+            reportCopied(automatic);
+            return true;
         }} catch (error) {{
-            message.textContent = 'Browser copy was blocked. Use the copy icon on the source block below.';
-            message.style.color = '#9a6700';
+            if (!automatic) {{
+                message.textContent =
+                    'Browser copy was blocked. Use the copy icon on the source block below.';
+                message.style.color = '#9a6700';
+            }}
+            return false;
         }}
-    }});
+    }}
+
+    button.addEventListener('click', () => copyNow(false));
+
+    if ({auto_flag}) {{
+        // A short delay lets the page settle before the clipboard is written.
+        setTimeout(() => copyNow(true), 150);
+    }}
     </script>
     """
-    components.html(html, height=66)
+    render_html_block(html, height=66)
+
+
+def render_html_block(html: str, height: int):
+    """
+    Renders a small HTML/JavaScript block.
+
+    Streamlit is retiring `components.html` in favour of `st.iframe`. Both are
+    supported here so that a future Streamlit upgrade on Community Cloud
+    cannot break the app while nobody is maintaining it.
+    """
+
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=height)
+        return
+
+    components.html(html, height=height)
 
 
 def status_label(status: str):
@@ -823,6 +978,56 @@ def save_chatgpt_result(record, validation, overwrite=False):
     advance_to_next_task()
 
 
+def handle_pasted_response(release_no: str):
+    """
+    Runs as soon as a pasted response is submitted (Ctrl+Enter or clicking away).
+
+    A clean response is validated, saved and the next case is opened without
+    any further click. Anything that needs a decision is left on screen exactly
+    as before.
+    """
+
+    response_text = st.session_state.get(f"chatgpt_response::{release_no}", "")
+
+    if not response_text.strip():
+        st.session_state.validation_results.pop(release_no, None)
+        return
+
+    record = load_release_record(release_no)
+
+    if record is None:
+        return
+
+    if release_no not in st.session_state.case_ids:
+        st.session_state.case_ids[release_no] = backend.generate_case_id(release_no)
+
+    case_id = st.session_state.case_ids[release_no]
+    source_block = backend.build_source_block(
+        record,
+        case_id,
+        backend.load_keywords(),
+    )
+
+    validation = validate_chatgpt_submission(
+        record,
+        case_id,
+        source_block,
+        response_text,
+    )
+    validation["submitted_text"] = response_text
+    st.session_state.validation_results[release_no] = validation
+
+    if validation["parse_error"] or validation["issues"]:
+        return
+
+    save_chatgpt_result(
+        record,
+        validation,
+        overwrite=bool(st.session_state.get(f"force_review::{release_no}")),
+    )
+    st.session_state.autosaved_release = release_no
+
+
 def render_validation_details(validation):
     with st.expander("Validation details", expanded=False):
         for check in validation.get("checks", []):
@@ -849,13 +1054,15 @@ def render_chatgpt_review(record):
 
     st.markdown('<div class="next-action">Next action · ChatGPT keyword & summary</div>', unsafe_allow_html=True)
     st.caption(
-        "Copy the prepared source package into the dedicated ChatGPT chat, then paste the complete response below."
+        "The prompt is copied to your clipboard automatically. Paste it into the "
+        "dedicated ChatGPT chat, paste the answer back below and press **Ctrl+Enter** — "
+        "a clean answer saves itself and the next case opens."
     )
 
     render_copy_button(
         source_block,
         key=case_id,
-        label="1 · Copy ChatGPT prompt",
+        label="Copy ChatGPT prompt",
     )
 
     with st.expander("Prompt / source details", expanded=False):
@@ -870,9 +1077,11 @@ def render_chatgpt_review(record):
 
     response_key = f"chatgpt_response::{release_no}"
     response_text = st.text_area(
-        "2 · Paste ChatGPT's complete machine-readable response",
+        "Paste ChatGPT's complete machine-readable response, then press Ctrl+Enter",
         key=response_key,
         height=260,
+        on_change=handle_pasted_response,
+        args=(release_no,),
         placeholder=(
             "Paste everything from <<< START OF MACHINE-READABLE RESPONSE >>> "
             "through <<< END OF MACHINE-READABLE RESPONSE >>>"
@@ -884,13 +1093,16 @@ def render_chatgpt_review(record):
         st.session_state.validation_results.pop(release_no, None)
         validation = None
 
-    button_label = "3 · Validate & replace →" if force_review else "3 · Validate & save →"
+    button_label = (
+        "Validate & replace →" if force_review else "Validate & save →"
+    )
 
     if st.button(
         button_label,
         type="primary",
         use_container_width=True,
         disabled=not response_text.strip(),
+        help="Only needed if pressing Ctrl+Enter in the box above did not start the check.",
     ):
         validation = validate_chatgpt_submission(
             record,
@@ -1067,8 +1279,49 @@ def render_run_complete():
         use_container_width=True,
     )
 
+    render_history_update_step()
+
     st.caption(
         "The temporary progress database remains available in the sidebar until you start a new run."
+    )
+
+
+def render_history_update_step():
+    """
+    Offers the updated history database for publishing.
+
+    This is the one step that is not automatic: the finished work has to go
+    back into the published database so that the next person -- and the daily
+    check -- see these releases as done. It is a download and a drag-and-drop.
+    """
+
+    if not st.session_state.get("history_seeded"):
+        return
+
+    st.divider()
+    st.markdown('<div class="next-action">Last step · Publish the updated database</div>', unsafe_allow_html=True)
+
+    try:
+        output_path = Path(st.session_state.session_dir) / "sec_history.db"
+        info = sec_history.build_history_database(DATABASE_FILE, output_path)
+        history_bytes = output_path.read_bytes()
+    except Exception as error:  # noqa: BLE001
+        st.warning(f"The updated history database could not be prepared: {error}")
+        return
+
+    st.download_button(
+        "Download updated database (sec_history.db)",
+        data=history_bytes,
+        file_name="sec_history.db",
+        mime="application/octet-stream",
+        use_container_width=True,
+    )
+    st.caption(
+        f"{info['releases']} releases, newest LR-{info['highest_release']}, "
+        f"{info['size_mb']} MB. Upload this file to the GitHub release "
+        "**data-latest** (replace the existing file). Until that is done, the "
+        "daily check will keep reporting these releases as outstanding. "
+        "Step-by-step instructions are in RUNBOOK.md."
     )
 
 
@@ -1216,26 +1469,118 @@ with st.sidebar:
 
 render_header()
 
-if not st.session_state.run_ready:
-    st.subheader("Start a release interval")
-    st.caption(
-        "The web version uses a temporary database for this browser session only. "
-        "Your local SEC database is never accessed."
-    )
+def start_run(high: int, low: int):
+    """Prepares the session database and extracts one interval."""
 
-    with st.container(border=True):
+    clear_session_database()
+    reset_review_state()
+    st.session_state.range_start = high
+    st.session_state.range_end = low
+
+    with st.status("Extracting SEC releases and Resource PDFs…", expanded=True) as status_box:
+        process_release_interval(high, low)
+        status_box.update(
+            label="Extraction complete",
+            state="complete",
+            expanded=False,
+        )
+
+    st.session_state.run_ready = True
+    select_release(first_incomplete_release())
+    st.rerun()
+
+
+if not st.session_state.run_ready:
+    history = load_history(st.session_state.history_reload)
+
+    with st.spinner("Checking SEC.gov for new releases…"):
+        listing = load_sec_listing(st.session_state.history_reload)
+        pending = pending_releases()
+
+    # ---- something is not reachable: say so, never imply "all done" ------
+    if not history["available"]:
+        st.subheader("Start a release interval")
+        st.warning(
+            "The published historical database could not be loaded, so the app "
+            "cannot tell which releases are new. Enter the interval manually below.",
+            icon="⚠️",
+        )
+        st.caption(history["error"])
+
+    elif not listing["available"]:
+        st.subheader("SEC.gov could not be reached")
+        st.warning(
+            "The list of published releases could not be downloaded, so new "
+            "releases cannot be detected right now. Try again in a few minutes, "
+            "or enter the interval manually below.",
+            icon="⚠️",
+        )
+        st.caption(
+            f"Newest release in the database: LR-{history['highest_stored']} · "
+            f"{listing['error']}"
+        )
+
+    # ---- the normal path: everything SEC has published that we do not ----
+    elif pending:
+        newest = pending[0]
+        oldest = pending[-1]
+        batch = pending[:MAX_RELEASES_PER_RUN]
+
+        st.subheader(
+            f"{len(pending)} new release(s) since LR-{history['highest_stored']}"
+        )
+
+        with st.container(border=True):
+            if len(batch) < len(pending):
+                st.caption(
+                    f"LR-{batch[0]} → LR-{batch[-1]} · first {len(batch)} of "
+                    f"{len(pending)} (one run is limited to {MAX_RELEASES_PER_RUN})"
+                )
+            else:
+                st.caption(f"LR-{newest} → LR-{oldest}")
+
+            if st.button(
+                f"Process these {len(batch)} release(s) →",
+                type="primary",
+                use_container_width=True,
+            ):
+                start_run(batch[0], batch[-1])
+
+            with st.expander("Which releases are these?", expanded=False):
+                for number in pending:
+                    detail = listing["details"].get(number, {})
+                    date_text = detail.get("date", "")
+                    respondents = detail.get("respondents", "")
+                    st.markdown(
+                        f"**LR-{number}** · {date_text} — {respondents}"
+                        if respondents
+                        else f"**LR-{number}**"
+                    )
+
+    else:
+        st.subheader("Everything published on SEC.gov has been processed")
+        st.caption(
+            f"Newest release in the database: LR-{history['highest_stored']} · "
+            f"{len(history['reviewed'])} of {len(history['stored'])} releases fully reviewed."
+        )
+
+    # ---- manual interval, always available -------------------------------
+    default_high = (history["highest_stored"] or 26585) + 10
+    default_low = (history["highest_stored"] or 26576) + 1
+
+    with st.expander("Choose a different interval", expanded=not pending):
         col1, col2 = st.columns(2)
 
         start_input = col1.number_input(
             "First release number",
             min_value=1,
-            value=26585,
+            value=int(default_high),
             step=1,
         )
         end_input = col2.number_input(
             "Last release number",
             min_value=1,
-            value=26576,
+            value=int(default_low),
             step=1,
         )
 
@@ -1253,26 +1598,20 @@ if not st.session_state.run_ready:
 
         if st.button(
             "Start processing →",
-            type="primary",
             use_container_width=True,
             disabled=count > MAX_RELEASES_PER_RUN,
         ):
-            clear_session_database()
-            reset_review_state()
-            st.session_state.range_start = high
-            st.session_state.range_end = low
+            start_run(high, low)
 
-            with st.status("Extracting SEC releases and Resource PDFs…", expanded=True) as status_box:
-                process_release_interval(high, low)
-                status_box.update(
-                    label="Extraction complete",
-                    state="complete",
-                    expanded=False,
-                )
-
-            st.session_state.run_ready = True
-            select_release(first_incomplete_release())
-            st.rerun()
+    if history["available"]:
+        st.caption(
+            "Already reviewed releases are recognised automatically and skipped, "
+            "and summaries are checked for duplicates against the whole history."
+        )
+    st.caption(
+        "This session works on a temporary copy of the database. Nothing is "
+        "changed on SEC.gov or in the published database until you upload a new one."
+    )
 
 else:
     next_task = first_incomplete_release()

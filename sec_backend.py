@@ -32,11 +32,14 @@ BASE_RELEASE_URL = (
     "litigation-releases/lr-"
 )
 
+# SEC's fair-access policy requires every automated request to identify itself
+# with a contact address. This must stay a mailbox that is actually read --
+# SEC writes to it before blocking a tool. Set SEC_CONTACT_EMAIL to override
+# without editing the code.
+SEC_CONTACT_EMAIL = os.environ.get("SEC_CONTACT_EMAIL", "sec.tool@pqs.ch").strip()
+
 HEADERS = {
-    "User-Agent": (
-        "SEC Litigation Manual Review Tool "
-        "mattia.tschopp@pqs.ch"
-    )
+    "User-Agent": f"SEC Litigation Manual Review Tool {SEC_CONTACT_EMAIL}"
 }
 
 REQUEST_DELAY_SECONDS = 0.20
