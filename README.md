@@ -3,6 +3,8 @@
 This is a separate browser-based edition of the SEC Litigation Release workflow.
 It does **not** use or update the local historical `sec_releases.db` database.
 
+https://sec-litigation-tool.streamlit.app/
+
 ## What the web app does
 
 1. User selects an SEC Litigation Release interval.
