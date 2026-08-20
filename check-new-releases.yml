@@ -1,0 +1,128 @@
+name: Check SEC for new litigation releases
+
+# ---------------------------------------------------------------------------
+# What this does, in plain words:
+#
+# Every weekday morning it looks at SEC.gov, compares the published litigation
+# releases against the database published under the "data-latest" release, and
+# opens (or updates) ONE GitHub issue listing whatever is missing. When nothing
+# is missing it closes that issue again. Nobody has to remember to check.
+#
+# It never changes the database and never touches the app.
+#
+# To run it by hand: Actions tab -> "Check SEC for new litigation releases"
+# -> "Run workflow".
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    # 05:30 UTC = 07:30 Zurich in summer, 06:30 in winter. Weekdays only.
+    - cron: "30 5 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  # Everyone listed here gets a GitHub notification when releases are pending.
+  # Comma-separated GitHub usernames.
+  NOTIFY_USERS: "mattiazh"
+  ISSUE_TITLE: "SEC litigation releases pending"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Check SEC.gov
+        id: check
+        run: python scripts/check_new_releases.py --output-dir check-output
+
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          BODY_FILE=check-output/report.md
+          {
+            echo ""
+            echo "---"
+            echo "_Checked automatically on $(date -u '+%Y-%m-%d %H:%M UTC'). This issue is updated by the daily check; do not open a second one._"
+          } >> "$BODY_FILE"
+
+          EXISTING=$(gh issue list \
+            --state open \
+            --search "\"$ISSUE_TITLE\" in:title" \
+            --json number,title \
+            --jq "[.[] | select(.title == env.ISSUE_TITLE)] | .[0].number // empty")
+
+          if [ "${{ steps.check.outputs.needs_notice }}" = "true" ]; then
+            if [ -n "$EXISTING" ]; then
+              gh issue edit "$EXISTING" --body-file "$BODY_FILE"
+              echo "Updated issue #$EXISTING"
+            else
+              ASSIGN=""
+              if [ -n "${NOTIFY_USERS}" ]; then
+                ASSIGN="--assignee ${NOTIFY_USERS}"
+              fi
+              # shellcheck disable=SC2086
+              gh issue create \
+                --title "$ISSUE_TITLE" \
+                --body-file "$BODY_FILE" \
+                $ASSIGN
+            fi
+          else
+            if [ -n "$EXISTING" ]; then
+              gh issue comment "$EXISTING" \
+                --body "Everything published on SEC.gov is now in the database. Closing."
+              gh issue close "$EXISTING"
+              echo "Closed issue #$EXISTING"
+            else
+              echo "Nothing pending, no open issue. Nothing to do."
+            fi
+          fi
+
+      # -------------------------------------------------------------------
+      # GitHub switches scheduled workflows off after 60 days without any
+      # repository activity. This writes a dated line to a side branch once a
+      # month so the schedule stays alive even when nobody commits for months.
+      # It touches a branch of its own, so the deployed app is never affected.
+      # -------------------------------------------------------------------
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ "$(date -u '+%d')" != "01" ]; then
+            echo "Not the first of the month, nothing to do."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin checker-heartbeat || true
+
+          if git show-ref --quiet refs/remotes/origin/checker-heartbeat; then
+            git checkout -B checker-heartbeat origin/checker-heartbeat
+          else
+            git checkout --orphan checker-heartbeat
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          date -u '+%Y-%m-%d %H:%M UTC — scheduled check alive' >> heartbeat.txt
+          git add heartbeat.txt
+          git commit -m "Keep scheduled check enabled"
+          git push origin checker-heartbeat
