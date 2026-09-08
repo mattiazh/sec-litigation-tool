@@ -1,0 +1,19 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+:root{color-scheme:light dark}body{margin:0;font:14px system-ui,sans-serif;color:var(--ink,#172339);background:transparent}label{display:block;font-weight:600;margin-bottom:8px}textarea{box-sizing:border-box;width:100%;height:250px;padding:14px;border:1px solid #a6b0c0;border-radius:8px;background:var(--field,#fff);color:inherit;font:14px/1.5 system-ui,sans-serif;resize:vertical}textarea:focus{outline:2px solid #315bea;outline-offset:1px}footer{display:flex;align-items:center;gap:14px;margin-top:10px}button{border:0;border-radius:7px;padding:11px 18px;background:#315bea;color:white;font:600 14px system-ui;cursor:pointer}button:disabled{opacity:.5;cursor:default}small{opacity:.8}
+</style></head><body><label for="answer"></label><textarea id="answer" aria-describedby="hint"></textarea><footer><button id="submit" type="button">Validate &amp; save →</button><small id="hint">Enter to submit · Shift+Enter for a new line</small></footer><script>
+const input=document.querySelector('textarea'), button=document.querySelector('button');
+let initialized=false, locked=false;
+function send(type,data={}){window.parent.postMessage({isStreamlitMessage:true,type,...data},'*')}
+function resize(){send('streamlit:setFrameHeight',{height:document.body.scrollHeight+4})}
+function submit(){if(locked||!input.value.trim())return;locked=true;button.disabled=true;send('streamlit:setComponentValue',{value:{text:input.value,id:crypto.randomUUID()},dataType:'json'})}
+button.addEventListener('click',submit);
+input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();submit()}});
+input.addEventListener('input',()=>{if(!locked)button.disabled=!input.value.trim()});
+window.addEventListener('message',e=>{if(e.source!==window.parent||e.data.type!=='streamlit:render')return;const a=e.data.args;
+document.querySelector('label').textContent=a.label;button.textContent=a.button_label;
+input.placeholder=a.placeholder||'';if(!initialized){input.value=a.initial||'';initialized=true;input.focus()}
+locked=false;button.disabled=!input.value.trim();
+const theme=e.data.theme||{};document.body.style.setProperty('--ink',theme.textColor||'#172339');document.body.style.setProperty('--field',theme.secondaryBackgroundColor||'#fff');resize();});
+new ResizeObserver(resize).observe(input);
+send('streamlit:componentReady',{apiVersion:1});resize();
+</script></body></html>

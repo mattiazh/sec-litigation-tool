@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import importlib.util
-import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -11,21 +10,34 @@ from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 
-import sec_feed
-import sec_history
+from archive_export import database_snapshot, validate_archive
 
 
 APP_DIR = Path(__file__).resolve().parent
 BACKEND_FILE = APP_DIR / "sec_backend.py"
 KEYWORDS_FILE = APP_DIR / "keywords.txt"
 MAX_RELEASES_PER_RUN = 75
-UI_VERSION = "assembly-line-v3"
+UI_VERSION = "manual-archive-v1"
+keyboard_component = components.declare_component("keyboard_input", path=str(APP_DIR / "keyboard_input"))
+
+
+def keyboard_answer(key, label, button_label, placeholder=""):
+    value = keyboard_component(label=label, button_label=button_label,
+        placeholder=placeholder, initial=st.session_state.get(key, ""),
+        key=f"keyboard::{key}", default=None)
+    submitted = False
+    if isinstance(value, dict) and value.get("id") != st.session_state.get(f"handled::{key}"):
+        st.session_state[f"handled::{key}"] = value.get("id")
+        st.session_state[key] = value.get("text", "")
+        submitted = True
+    return st.session_state.get(key, ""), submitted
+
 
 st.set_page_config(
     page_title="SEC Litigation Release Tool",
     page_icon="⚖️",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 
@@ -132,9 +144,9 @@ def initialize_session_state():
         "excel_bytes": None,
         "excel_name": None,
         "last_processing_log": [],
-        "history_seeded": False,
-        "history_reload": 0,
         "autosaved_release": None,
+        "archive_bytes": None,
+        "archive_name": None,
     }
 
     for key, value in defaults.items():
@@ -194,103 +206,33 @@ def db_connection():
 
 
 # -----------------------------------------------------------------------------
-# PUBLISHED HISTORY
-#
-# The historical database is published as a GitHub release asset and downloaded
-# here. It gives the app three things it did not have before:
-#   - it knows which releases have already been processed;
-#   - duplicate-summary detection works against the whole history, not just
-#     the current browser session;
-#   - the start screen can offer the new releases directly.
-# If the download fails the app still works exactly as it did before.
+# SESSION DATABASE
+# Each run is archived by the user. No GitHub history or background checker.
 # -----------------------------------------------------------------------------
-
-
-@st.cache_resource(show_spinner=False)
-def load_history(cache_buster: int = 0):
-    try:
-        path = sec_history.download_history()
-    except sec_history.HistoryUnavailable as error:
-        return {
-            "available": False,
-            "error": str(error),
-            "stored": set(),
-            "reviewed": set(),
-            "highest_stored": None,
-            "info": {},
-            "path": None,
-        }
-
-    index = sec_history.read_index(path)
-    index["available"] = True
-    index["error"] = ""
-    index["path"] = str(path)
-    index["info"] = sec_history.read_info(path)
-    return index
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_sec_listing(cache_buster: int = 0):
-    """Which releases SEC.gov currently shows. Cached for 30 minutes."""
-
-    try:
-        listing = sec_feed.fetch_published_releases()
-    except Exception as error:  # noqa: BLE001
-        return {"available": False, "error": str(error), "numbers": [], "details": {}}
-
-    return {
-        "available": True,
-        "error": "",
-        "numbers": sorted(listing.numbers, reverse=True),
-        "details": listing.details,
-    }
-
-
-def pending_releases():
-    """Release numbers published by SEC that are not yet in the history."""
-
-    history = load_history(st.session_state.get("history_reload", 0))
-    listing = load_sec_listing(st.session_state.get("history_reload", 0))
-
-    if not listing["available"] or not history["available"]:
-        return []
-
-    highest_stored = history["highest_stored"] or 0
-    floor = max(min(listing["numbers"]), highest_stored - 50)
-
-    return sorted(
-        (
-            number
-            for number in listing["numbers"]
-            if number >= floor and number not in history["stored"]
-        ),
-        reverse=True,
-    )
-
-
-def seed_session_database():
-    """Starts the session database from the published history, when available."""
-
-    history = load_history(st.session_state.get("history_reload", 0))
-
-    if history["available"] and history["path"]:
-        try:
-            shutil.copyfile(history["path"], DATABASE_FILE)
-            backend.create_database()
-            st.session_state.history_seeded = True
-            return True
-        except Exception:  # noqa: BLE001 - fall back to an empty database
-            DATABASE_FILE.unlink(missing_ok=True)
-
-    backend.create_database()
-    st.session_state.history_seeded = False
-    return False
 
 
 def clear_session_database():
     if DATABASE_FILE.exists():
         DATABASE_FILE.unlink()
-    seed_session_database()
+    backend.create_database()
+
+
+def prepare_archive():
+    if st.session_state.archive_bytes is None:
+        data, name = database_snapshot(
+            DATABASE_FILE, st.session_state.session_dir,
+            st.session_state.range_start, st.session_state.range_end,
+        )
+        st.session_state.archive_bytes = data
+        st.session_state.archive_name = name
+    return st.session_state.archive_bytes, st.session_state.archive_name
+
+
+def invalidate_exports():
+    st.session_state.excel_bytes = None
+    st.session_state.excel_name = None
+    st.session_state.archive_bytes = None
+    st.session_state.archive_name = None
 
 
 def infer_range_from_database():
@@ -486,35 +428,23 @@ def advance_to_next_task():
 def validate_uploaded_database(uploaded_bytes: bytes):
     temp_path = Path(st.session_state.session_dir) / "resume_validation.db"
     temp_path.write_bytes(uploaded_bytes)
-
     try:
-        connection = sqlite3.connect(temp_path)
-        release_table = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='releases'"
-        ).fetchone()
-        documents_table = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='documents'"
-        ).fetchone()
-        connection.close()
-
-        if not release_table or not documents_table:
-            return False, "The uploaded file is not a valid SEC Litigation progress database."
-
-        return True, ""
-
-    except sqlite3.DatabaseError as error:
-        return False, f"SQLite could not read the uploaded file: {error}"
-
+        return validate_archive(temp_path), ""
+    except (sqlite3.Error, ValueError, OSError) as error:
+        return None, str(error)
     finally:
-        if temp_path.exists():
-            temp_path.unlink()
+        temp_path.unlink(missing_ok=True)
 
 
 def reset_review_state():
+    prefixes = ("chatgpt_response::", "manual_pdf_text::", "keyboard::", "handled::",
+                "force_review::", "confirm_short::", "source_presented::")
+    for key in list(st.session_state):
+        if key.startswith(prefixes):
+            del st.session_state[key]
     st.session_state.case_ids = {}
     st.session_state.validation_results = {}
-    st.session_state.excel_bytes = None
-    st.session_state.excel_name = None
+    invalidate_exports()
 
 
 # -----------------------------------------------------------------------------
@@ -901,11 +831,9 @@ def render_manual_pdf_recovery(record):
 
     st.warning(document["review_reason"] or "Automatic text extraction was unreliable.")
 
-    manual_text = st.text_area(
-        "Paste the complete readable text from the PDF",
-        key=text_key,
-        height=245,
-        placeholder="Open the SEC PDF, extract the readable text manually, then paste it here…",
+    manual_text, submitted = keyboard_answer(
+        text_key, "Paste the complete readable text from the PDF", "Save PDF text & continue →",
+        "Paste the full recovered text. Enter submits; Shift+Enter adds a line.",
     )
 
     wrong_paste_reason = ""
@@ -937,20 +865,17 @@ def render_manual_pdf_recovery(record):
         or not confirmed_short
     )
 
-    if st.button(
-        "Save & continue →",
-        key=f"save_manual::{record['Release No.']}::{document_identifier}",
-        type="primary",
-        disabled=save_disabled,
-        use_container_width=True,
-    ):
+    confirm_save = False
+    if short_text and confirmed_short and not save_disabled:
+        confirm_save = st.button("Save confirmed short text →", type="primary",
+                                 key=f"save_manual::{record['Release No.']}::{document_identifier}")
+    if (submitted or confirm_save) and not save_disabled:
         backend.save_manual_document_text(
             record["Release No."],
             document,
             manual_text,
         )
-        st.session_state.excel_bytes = None
-        st.session_state.excel_name = None
+        invalidate_exports()
         st.session_state.pop(text_key, None)
         st.session_state.validation_results.pop(record["Release No."], None)
         st.toast("Manual PDF text saved.", icon="✅")
@@ -970,62 +895,11 @@ def save_chatgpt_result(record, validation, overwrite=False):
         parsed["complaint"],
         overwrite=overwrite,
     )
-    st.session_state.excel_bytes = None
-    st.session_state.excel_name = None
+    invalidate_exports()
     st.session_state.validation_results.pop(record["Release No."], None)
     st.session_state.pop(f"force_review::{record['Release No.']}", None)
     st.session_state.pop(f"chatgpt_response::{record['Release No.']}", None)
     advance_to_next_task()
-
-
-def handle_pasted_response(release_no: str):
-    """
-    Runs as soon as a pasted response is submitted (Ctrl+Enter or clicking away).
-
-    A clean response is validated, saved and the next case is opened without
-    any further click. Anything that needs a decision is left on screen exactly
-    as before.
-    """
-
-    response_text = st.session_state.get(f"chatgpt_response::{release_no}", "")
-
-    if not response_text.strip():
-        st.session_state.validation_results.pop(release_no, None)
-        return
-
-    record = load_release_record(release_no)
-
-    if record is None:
-        return
-
-    if release_no not in st.session_state.case_ids:
-        st.session_state.case_ids[release_no] = backend.generate_case_id(release_no)
-
-    case_id = st.session_state.case_ids[release_no]
-    source_block = backend.build_source_block(
-        record,
-        case_id,
-        backend.load_keywords(),
-    )
-
-    validation = validate_chatgpt_submission(
-        record,
-        case_id,
-        source_block,
-        response_text,
-    )
-    validation["submitted_text"] = response_text
-    st.session_state.validation_results[release_no] = validation
-
-    if validation["parse_error"] or validation["issues"]:
-        return
-
-    save_chatgpt_result(
-        record,
-        validation,
-        overwrite=bool(st.session_state.get(f"force_review::{release_no}")),
-    )
-    st.session_state.autosaved_release = release_no
 
 
 def render_validation_details(validation):
@@ -1054,16 +928,15 @@ def render_chatgpt_review(record):
 
     st.markdown('<div class="next-action">Next action · ChatGPT keyword & summary</div>', unsafe_allow_html=True)
     st.caption(
-        "The prompt is copied to your clipboard automatically. Paste it into the "
-        "dedicated ChatGPT chat, paste the answer back below and press **Ctrl+Enter** — "
+        "Copy the prompt (or use the automatic copy when your browser allows it). Paste it into the "
+        "dedicated ChatGPT chat, paste the answer back below and press **Enter** — "
         "a clean answer saves itself and the next case opens."
     )
 
-    render_copy_button(
-        source_block,
-        key=case_id,
-        label="Copy ChatGPT prompt",
-    )
+    copy_key = f"source_presented::{case_id}"
+    render_copy_button(source_block, key=case_id, label="Copy ChatGPT prompt",
+                       auto_copy=not st.session_state.get(copy_key, False))
+    st.session_state[copy_key] = True
 
     with st.expander("Prompt / source details", expanded=False):
         st.download_button(
@@ -1076,34 +949,18 @@ def render_chatgpt_review(record):
         st.code(source_block, language=None, wrap_lines=True)
 
     response_key = f"chatgpt_response::{release_no}"
-    response_text = st.text_area(
-        "Paste ChatGPT's complete machine-readable response, then press Ctrl+Enter",
-        key=response_key,
-        height=260,
-        on_change=handle_pasted_response,
-        args=(release_no,),
-        placeholder=(
-            "Paste everything from <<< START OF MACHINE-READABLE RESPONSE >>> "
-            "through <<< END OF MACHINE-READABLE RESPONSE >>>"
-        ),
+    response_text, submitted = keyboard_answer(
+        response_key,
+        "Paste ChatGPT’s complete response",
+        "Validate & replace →" if force_review else "Validate & save →",
+        "Paste everything from the START OF MACHINE-READABLE RESPONSE marker through the END marker.",
     )
-
     validation = st.session_state.validation_results.get(release_no)
     if validation and validation.get("submitted_text") != response_text:
         st.session_state.validation_results.pop(release_no, None)
         validation = None
 
-    button_label = (
-        "Validate & replace →" if force_review else "Validate & save →"
-    )
-
-    if st.button(
-        button_label,
-        type="primary",
-        use_container_width=True,
-        disabled=not response_text.strip(),
-        help="Only needed if pressing Ctrl+Enter in the box above did not start the check.",
-    ):
+    if submitted and response_text.strip():
         validation = validate_chatgpt_submission(
             record,
             case_id,
@@ -1245,84 +1102,51 @@ def render_release_review(release_no: str):
 
 def render_run_complete():
     counts = count_statuses()
-    total = len(release_numbers_for_current_run())
     unavailable = counts["unavailable"] + counts["missing"]
-
-    st.markdown('<div class="next-action">Run complete · Export</div>', unsafe_allow_html=True)
-    st.subheader("The review queue is finished")
-
+    st.subheader("Save your two files")
     if unavailable:
-        st.warning(
-            f"{unavailable} release(s) were unavailable or not extractable. "
-            "They will still appear in Excel with the information that is available."
-        )
+        st.warning(f"{unavailable} release(s) could not be retrieved. Their available data and any document flags are retained in the downloads.")
     else:
-        st.success(f"All {total} releases are complete.")
+        st.success("All releases in this interval have been reviewed.")
+    st.write("Download the Excel report and the full database, then keep both in your archive folder.")
 
-    if st.session_state.excel_bytes is None:
-        with st.spinner("Preparing Excel report…"):
-            try:
-                release_count, document_count = generate_excel_report()
-                st.caption(
-                    f"Prepared {release_count} releases and {document_count} Resource document links."
-                )
-            except Exception as error:
-                st.error(f"Excel export failed: {error}")
-                return
-
-    st.download_button(
-        "Download Excel report",
-        data=st.session_state.excel_bytes,
-        file_name=st.session_state.excel_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-        use_container_width=True,
-    )
-
-    render_history_update_step()
-
-    st.caption(
-        "The temporary progress database remains available in the sidebar until you start a new run."
-    )
-
-
-def render_history_update_step():
-    """
-    Offers the updated history database for publishing.
-
-    This is the one step that is not automatic: the finished work has to go
-    back into the published database so that the next person -- and the daily
-    check -- see these releases as done. It is a download and a drag-and-drop.
-    """
-
-    if not st.session_state.get("history_seeded"):
-        return
-
-    st.divider()
-    st.markdown('<div class="next-action">Last step · Publish the updated database</div>', unsafe_allow_html=True)
-
+    # Independent exports: an Excel error must never prevent archiving the data.
     try:
-        output_path = Path(st.session_state.session_dir) / "sec_history.db"
-        info = sec_history.build_history_database(DATABASE_FILE, output_path)
-        history_bytes = output_path.read_bytes()
-    except Exception as error:  # noqa: BLE001
-        st.warning(f"The updated history database could not be prepared: {error}")
-        return
+        if st.session_state.excel_bytes is None:
+            generate_excel_report()
+        st.download_button(
+            "1. Download Excel report", data=st.session_state.excel_bytes,
+            file_name=st.session_state.excel_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary", use_container_width=True, on_click="ignore",
+        )
+    except Exception as error:
+        st.error(f"Excel export failed: {error}. You can still save the database below.")
+    try:
+        data, name = prepare_archive()
+        st.download_button(
+            "2. Download full database (.db)", data=data, file_name=name,
+            mime="application/octet-stream", use_container_width=True, on_click="ignore",
+        )
+    except Exception as error:
+        st.error(f"Database export failed: {error}. Keep this session open and retry.")
+    st.caption("The database contains full stored PDF text, recovered text, release details, summaries, links and extraction flags. It contains this run’s data, not the original PDF files.")
+    st.info("Save both files before closing this tab. Work is temporary until you download it; no upload to GitHub is needed.")
+    saved = st.checkbox("I have saved both files.", key="saved_both_files")
+    if st.button("Start another interval", disabled=not saved):
+        return_to_start()
 
-    st.download_button(
-        "Download updated database (sec_history.db)",
-        data=history_bytes,
-        file_name="sec_history.db",
-        mime="application/octet-stream",
-        use_container_width=True,
-    )
-    st.caption(
-        f"{info['releases']} releases, newest LR-{info['highest_release']}, "
-        f"{info['size_mb']} MB. Upload this file to the GitHub release "
-        "**data-latest** (replace the existing file). Until that is done, the "
-        "daily check will keep reporting these releases as outstanding. "
-        "Step-by-step instructions are in RUNBOOK.md."
-    )
+
+def return_to_start():
+    clear_session_database()
+    st.session_state.range_start = None
+    st.session_state.range_end = None
+    st.session_state.run_ready = False
+    st.session_state.selected_release = None
+    st.session_state.last_processing_log = []
+    st.session_state.pop("saved_both_files", None)
+    reset_review_state()
+    st.rerun()
 
 
 # -----------------------------------------------------------------------------
@@ -1331,135 +1155,46 @@ def render_history_update_step():
 
 
 with st.sidebar:
-    st.markdown("### SEC Litigation Tool")
-    st.caption("Assembly-line mode")
-
+    st.caption("Optional tools")
     if st.session_state.run_ready:
         statuses = all_statuses()
-        release_options = [release_no for release_no, _, _ in statuses]
-        next_task = first_incomplete_release()
-
-        st.markdown(
-            f"**LR-{st.session_state.range_start} → LR-{st.session_state.range_end}**"
-        )
-        counts = count_statuses()
-        st.caption(
-            f"{counts['complete']} complete · {counts['manual']} manual PDF · "
-            f"{counts['chatgpt']} ChatGPT"
-        )
-
-        if release_options:
-            if (
-                st.session_state.selected_release not in release_options
-                and st.session_state.selected_release is not None
-            ):
-                select_release(next_task)
-
-            jump_options = ["— Select a release —", *release_options]
-            current_jump_index = (
-                release_options.index(st.session_state.selected_release) + 1
-                if st.session_state.selected_release in release_options
-                else 0
-            )
-            selected = st.selectbox(
-                "Jump to release",
-                jump_options,
-                index=current_jump_index,
-                key=f"jump_release_selector::{st.session_state.selected_release or 'none'}",
-                help="Normally you do not need this. Use it only to inspect or revisit another release.",
-            )
-
-            if selected != "— Select a release —" and selected != st.session_state.selected_release:
-                st.session_state.selected_release = selected
-
-            if next_task and st.session_state.selected_release != next_task:
-                if st.button("Return to next task", use_container_width=True):
-                    select_release(next_task)
-                    st.rerun()
-
-        with st.expander("View all releases", expanded=False):
-            for release_no, status, detail in statuses:
-                marker = "→" if release_no == st.session_state.selected_release else ""
-                st.markdown(f"{marker} **{release_no}** · {status_label(status)}")
-                if status in {"manual", "unavailable", "missing"}:
-                    st.caption(detail)
-
-        with st.expander("Session & recovery", expanded=False):
-            progress_bytes = DATABASE_FILE.read_bytes() if DATABASE_FILE.exists() else b""
-            st.download_button(
-                "Download progress database",
-                data=progress_bytes,
-                file_name=(
-                    f"SEC_progress_LR-{st.session_state.range_start}_"
-                    f"to_LR-{st.session_state.range_end}.db"
-                ),
-                mime="application/octet-stream",
-                use_container_width=True,
-            )
-
-            if st.session_state.last_processing_log:
-                with st.expander("Extraction log"):
-                    for line in st.session_state.last_processing_log:
-                        st.text(line)
-
-            if st.button("Start a new run", use_container_width=True):
-                clear_session_database()
-                st.session_state.range_start = None
-                st.session_state.range_end = None
-                st.session_state.run_ready = False
-                st.session_state.selected_release = None
-                reset_review_state()
-                st.rerun()
-
-        if first_incomplete_release() is not None:
-            with st.expander("Export current results", expanded=False):
-                if st.button("Prepare Excel now", use_container_width=True):
-                    try:
-                        release_count, document_count = generate_excel_report()
-                        st.success(
-                            f"Prepared {release_count} releases / {document_count} Resource documents."
-                        )
-                    except Exception as error:
-                        st.error(f"Excel export failed: {error}")
-
-                if st.session_state.excel_bytes:
-                    st.download_button(
-                        "Download current Excel",
-                        data=st.session_state.excel_bytes,
-                        file_name=st.session_state.excel_name,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-
+        options = [r for r, _, _ in statuses]
+        selection = st.selectbox("Inspect a release", ["Current task", *options])
+        if st.button("Open selected release") and selection != "Current task":
+            select_release(selection)
+            st.rerun()
+        if st.button("Return to current task"):
+            advance_to_next_task()
+            st.rerun()
+        with st.expander("Pause / save progress"):
+            try:
+                data, name = prepare_archive()
+                st.download_button("Download full progress database", data=data, file_name=name,
+                                   mime="application/octet-stream", on_click="ignore")
+            except Exception as error:
+                st.error(f"Database export failed: {error}")
+            st.caption("You can resume this file from the start screen later.")
+            saved_progress = st.checkbox("I downloaded my progress and want to end this run.")
+            if st.button("End this run", disabled=not saved_progress):
+                return_to_start()
+        with st.expander("Extraction log"):
+            for line in st.session_state.last_processing_log:
+                st.text(line)
     else:
-        with st.expander("Resume previous run", expanded=False):
-            resume_file = st.file_uploader(
-                "Upload progress database",
-                type=["db", "sqlite", "sqlite3"],
-                label_visibility="collapsed",
-            )
-
-            if resume_file is not None:
-                if st.button("Resume uploaded run", use_container_width=True):
-                    uploaded_bytes = resume_file.getvalue()
-                    valid, error_message = validate_uploaded_database(uploaded_bytes)
-
-                    if not valid:
-                        st.error(error_message)
-                    else:
-                        DATABASE_FILE.write_bytes(uploaded_bytes)
-                        backend.create_database()
-                        inferred_start, inferred_end = infer_range_from_database()
-
-                        if inferred_start is None:
-                            st.error("The uploaded database does not contain any releases.")
-                        else:
-                            st.session_state.range_start = inferred_start
-                            st.session_state.range_end = inferred_end
-                            st.session_state.run_ready = True
-                            reset_review_state()
-                            select_release(first_incomplete_release())
-                            st.rerun()
+        with st.expander("Resume a saved database"):
+            upload = st.file_uploader("Full database (.db)", type=["db", "sqlite", "sqlite3"])
+            if upload is not None and st.button("Resume review"):
+                interval, error = validate_uploaded_database(upload.getvalue())
+                if interval is None:
+                    st.error(error)
+                else:
+                    DATABASE_FILE.write_bytes(upload.getvalue())
+                    backend.create_database()
+                    st.session_state.range_start, st.session_state.range_end = interval
+                    st.session_state.run_ready = True
+                    reset_review_state()
+                    select_release(first_incomplete_release())
+                    st.rerun()
 
 
 # -----------------------------------------------------------------------------
@@ -1491,127 +1226,22 @@ def start_run(high: int, low: int):
 
 
 if not st.session_state.run_ready:
-    history = load_history(st.session_state.history_reload)
-
-    with st.spinner("Checking SEC.gov for new releases…"):
-        listing = load_sec_listing(st.session_state.history_reload)
-        pending = pending_releases()
-
-    # ---- something is not reachable: say so, never imply "all done" ------
-    if not history["available"]:
-        st.subheader("Start a release interval")
-        st.warning(
-            "The published historical database could not be loaded, so the app "
-            "cannot tell which releases are new. Enter the interval manually below.",
-            icon="⚠️",
-        )
-        st.caption(history["error"])
-
-    elif not listing["available"]:
-        st.subheader("SEC.gov could not be reached")
-        st.warning(
-            "The list of published releases could not be downloaded, so new "
-            "releases cannot be detected right now. Try again in a few minutes, "
-            "or enter the interval manually below.",
-            icon="⚠️",
-        )
-        st.caption(
-            f"Newest release in the database: LR-{history['highest_stored']} · "
-            f"{listing['error']}"
-        )
-
-    # ---- the normal path: everything SEC has published that we do not ----
-    elif pending:
-        newest = pending[0]
-        oldest = pending[-1]
-        batch = pending[:MAX_RELEASES_PER_RUN]
-
-        st.subheader(
-            f"{len(pending)} new release(s) since LR-{history['highest_stored']}"
-        )
-
-        with st.container(border=True):
-            if len(batch) < len(pending):
-                st.caption(
-                    f"LR-{batch[0]} → LR-{batch[-1]} · first {len(batch)} of "
-                    f"{len(pending)} (one run is limited to {MAX_RELEASES_PER_RUN})"
-                )
-            else:
-                st.caption(f"LR-{newest} → LR-{oldest}")
-
-            if st.button(
-                f"Process these {len(batch)} release(s) →",
-                type="primary",
-                use_container_width=True,
-            ):
-                start_run(batch[0], batch[-1])
-
-            with st.expander("Which releases are these?", expanded=False):
-                for number in pending:
-                    detail = listing["details"].get(number, {})
-                    date_text = detail.get("date", "")
-                    respondents = detail.get("respondents", "")
-                    st.markdown(
-                        f"**LR-{number}** · {date_text} — {respondents}"
-                        if respondents
-                        else f"**LR-{number}**"
-                    )
-
-    else:
-        st.subheader("Everything published on SEC.gov has been processed")
-        st.caption(
-            f"Newest release in the database: LR-{history['highest_stored']} · "
-            f"{len(history['reviewed'])} of {len(history['stored'])} releases fully reviewed."
-        )
-
-    # ---- manual interval, always available -------------------------------
-    default_high = (history["highest_stored"] or 26585) + 10
-    default_low = (history["highest_stored"] or 26576) + 1
-
-    with st.expander("Choose a different interval", expanded=not pending):
-        col1, col2 = st.columns(2)
-
-        start_input = col1.number_input(
-            "First release number",
-            min_value=1,
-            value=int(default_high),
-            step=1,
-        )
-        end_input = col2.number_input(
-            "Last release number",
-            min_value=1,
-            value=int(default_low),
-            step=1,
-        )
-
-        high = max(int(start_input), int(end_input))
-        low = min(int(start_input), int(end_input))
-        count = high - low + 1
-
-        st.caption(f"{count} release(s): LR-{high} through LR-{low}")
-
-        if count > MAX_RELEASES_PER_RUN:
-            st.error(
-                f"One web run is limited to {MAX_RELEASES_PER_RUN} releases. "
-                "Use a smaller interval."
-            )
-
-        if st.button(
-            "Start processing →",
-            use_container_width=True,
-            disabled=count > MAX_RELEASES_PER_RUN,
-        ):
-            start_run(high, low)
-
-    if history["available"]:
-        st.caption(
-            "Already reviewed releases are recognised automatically and skipped, "
-            "and summaries are checked for duplicates against the whole history."
-        )
-    st.caption(
-        "This session works on a temporary copy of the database. Nothing is "
-        "changed on SEC.gov or in the published database until you upload a new one."
-    )
+    st.subheader("Which releases would you like to review?")
+    st.write("Enter your interval. Review each release with ChatGPT, then download Excel and a full database archive.")
+    with st.form("release_interval"):
+        newest, oldest = st.columns(2)
+        high = newest.number_input("Newest release number", min_value=1, value=None, step=1, placeholder="e.g. 26585")
+        low = oldest.number_input("Oldest release number", min_value=1, value=None, step=1, placeholder="e.g. 26580")
+        st.caption("Use the same number twice to review a single release.")
+        submitted = st.form_submit_button("Start review →", type="primary", use_container_width=True)
+    if submitted:
+        if high is None or low is None or high < low:
+            st.error("Enter both numbers. The newest must be at least as large as the oldest.")
+        elif high - low + 1 > MAX_RELEASES_PER_RUN:
+            st.error(f"Use an interval of at most {MAX_RELEASES_PER_RUN} releases per run.")
+        else:
+            start_run(int(high), int(low))
+    st.caption("No installation is needed. Save both downloads at the end to keep your work.")
 
 else:
     next_task = first_incomplete_release()
